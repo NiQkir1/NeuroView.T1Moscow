@@ -1,0 +1,25 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Установка зависимостей
+COPY package.json package-lock.json* ./
+RUN npm install
+
+# Копирование кода
+COPY . .
+
+# Запуск в режиме разработки (с HMR)
+CMD ["npm", "run", "dev"]
+
+
+
+
+
+
+
+
+
+
+
+
