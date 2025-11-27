@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import String, func
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 import logging
@@ -22,9 +22,10 @@ from backend.models import (
     Interview, InterviewSession, User, Role, Question, Answer, TestTask,
     ApplicationStatus
 )
-from backend.models.interview import InterviewStatus
+from backend.models.interview import InterviewStatus, QuestionType
 from backend.models.user import RoleType, ExperienceLevel
 from backend.models.message import Message, MessageStatus, InterviewInvitation
+from backend.models.task_bank import TaskTemplate
 from backend.services.ai_engine import ai_engine
 from backend.services.interview_service import interview_service
 from backend.services.code_executor import code_executor
@@ -62,6 +63,7 @@ app.add_middleware(
 
 # Security
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
 
 
 # Dependency для получения текущего пользователя
@@ -85,6 +87,33 @@ async def get_current_user(
     
     # Не загружаем связанные объекты, чтобы избежать проблем с новыми полями
     # SQLAlchemy будет использовать lazy loading только при необходимости
+    return user
+
+
+async def get_optional_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+    db: Session = Depends(get_db)
+) -> Optional[User]:
+    """
+    Опциональное получение текущего пользователя.
+    Если токен не передан, возвращаем None. Если токен недействителен — выбрасываем 401.
+    """
+    if credentials is None:
+        return None
+    
+    token = credentials.credentials
+    payload = decode_access_token(token)
+    if payload is None:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+    
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+    
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    
     return user
 
 
@@ -390,7 +419,18 @@ async def delete_user(
         raise HTTPException(status_code=403, detail="Нельзя удалять администраторов. Сначала измените роль пользователя.")
     
     try:
-        # Удаляем пользователя (каскадное удаление удалит связанные сессии)
+        # Удаляем все сессии кандидата, чтобы одновременно удалить отчеты и связанные данные
+        sessions = db.query(InterviewSession).filter(InterviewSession.candidate_id == user.id).all()
+        for session in sessions:
+            db.delete(session)
+        
+        # Отвязываем сущности, где достаточно обнулить ссылку на пользователя
+        db.query(Interview).filter(Interview.created_by == user.id).update({Interview.created_by: None})
+        db.query(TestTask).filter(TestTask.reviewed_by == user.id).update({TestTask.reviewed_by: None})
+        db.query(TaskTemplate).filter(TaskTemplate.created_by == user.id).update({TaskTemplate.created_by: None})
+        db.flush()
+        
+        # Удаляем пользователя (сессии уже удалены, отчеты исчезают вместе с ними)
         db.delete(user)
         db.commit()
         
@@ -1751,10 +1791,336 @@ class ChatMessageRequest(BaseModel):
     question_context: Optional[str] = None
     interview_config: Optional[Dict[str, Any]] = None
 
+
+class TrainingChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class TrainingReportRequest(BaseModel):
+    conversation_history: List[TrainingChatMessage]
+    interview_config: Optional[Dict[str, Any]] = None
+
+
+_TRAINING_QUESTION_MARKERS = [
+    "**первый вопрос:**",
+    "**следующий вопрос:**",
+    "**вопрос:**",
+    "**question:**",
+    "**задача:**",
+]
+
+
+def _extract_training_question(text: str) -> Optional[str]:
+    if not text:
+        return None
+    lowered = text.lower()
+    for marker in _TRAINING_QUESTION_MARKERS:
+        idx = lowered.find(marker)
+        if idx != -1:
+            start = idx + len(marker)
+            question_part = text[start:].strip()
+            # Удаляем лишние звездочки/пробелы
+            question_part = question_part.lstrip("*").strip()
+            # Ограничиваемся первым абзацем
+            separator = "\n\n"
+            if separator in question_part:
+                question_part = question_part.split(separator, 1)[0].strip()
+            return question_part if question_part else None
+    return None
+
+
+def _classify_training_stage(text: str) -> str:
+    if not text:
+        return "introduction"
+    lower_text = text.lower()
+    if "[live_coding]" in lower_text or "лайвкодинг" in lower_text or "live coding" in lower_text:
+        return "liveCoding"
+    
+    technical_keywords = [
+        "алгоритм", "сложность", "структура данных", "function", "код", "code",
+        "реализуйте", "implement", "напишите", "напишите код", "write code", "data structure",
+        "performance", "оптимиз", "memory", "big o", "время выполнения"
+    ]
+    soft_keywords = [
+        "команда", "team", "конфликт", "conflict", "коммуникац", "communication",
+        "лидер", "leader", "мотивац", "motivation", "soft skills", "отношения"
+    ]
+    introduction_keywords = [
+        "расскажите", "project", "проект", "опыт", "experience", "достижен", "achievement",
+        "образование", "education", "career", "карьер"
+    ]
+    
+    if any(keyword in lower_text for keyword in technical_keywords):
+        return "technical"
+    if any(keyword in lower_text for keyword in soft_keywords):
+        return "softSkills"
+    if any(keyword in lower_text for keyword in introduction_keywords):
+        return "introduction"
+    
+    return "introduction"
+
+
+def _resolve_training_topic(config: Dict[str, Any]) -> str:
+    topics = config.get("topics") or config.get("required_skills") or []
+    if isinstance(topics, list) and topics:
+        return str(topics[0])
+    if isinstance(topics, str) and topics:
+        return topics
+    return "general"
+
+
+def _build_training_pairs(messages: List[TrainingChatMessage]) -> List[Dict[str, Any]]:
+    pairs: List[Dict[str, Any]] = []
+    for msg in messages:
+        role = (msg.role or "").lower()
+        content = msg.content or ""
+        if role == "assistant":
+            question_text = _extract_training_question(content)
+            if question_text:
+                stage = _classify_training_stage(content)
+                pairs.append({
+                    "question_text": question_text,
+                    "stage": stage,
+                    "raw": content,
+                    "answer_text": None,
+                })
+        elif role == "user":
+            if pairs and pairs[-1]["answer_text"] is None:
+                pairs[-1]["answer_text"] = content.strip()
+    return [pair for pair in pairs if pair.get("answer_text")]
+
+
+async def _evaluate_training_answer(
+    stage: str,
+    question_text: str,
+    answer_text: str,
+    config: Dict[str, Any],
+    session_key: str
+) -> Tuple[float, Dict[str, Any]]:
+    """Вспомогательная функция оценки ответов для тренировочных отчетов"""
+    if not answer_text or len(answer_text.strip()) < 5:
+        return 0.0, {
+            "score": 0,
+            "correctness": 0,
+            "completeness": 0,
+            "quality": 0,
+            "feedback": "Ответ не предоставлен или слишком короткий.",
+            "strengths": [],
+            "improvements": ["Предоставьте развернутый ответ на вопрос."],
+        }
+    
+    try:
+        from backend.services.agents import general_agent, technical_agent
+        
+        if stage in ["introduction", "softSkills"]:
+            question_type = "experience" if stage == "introduction" else "team"
+            result = await general_agent.process({
+                "action": "evaluate_answer",
+                "question": question_text,
+                "answer": answer_text,
+                "question_type": question_type,
+                "interview_config": config,
+            })
+            base_score = float(result.get("evaluation", 5) or 5)
+            score = base_score * 10
+            evaluation_payload = {
+                "score": score,
+                "correctness": base_score,
+                "completeness": base_score,
+                "quality": base_score,
+                "feedback": result.get("feedback", ""),
+                "strengths": result.get("strengths", []),
+                "improvements": result.get("improvements", []),
+                "extracted_info": result.get("extracted_info", {}),
+            }
+            return score, evaluation_payload
+        
+        topic = _resolve_training_topic(config)
+        result = await technical_agent.process({
+            "action": "evaluate_answer",
+            "question": question_text,
+            "answer": answer_text,
+            "topic": topic,
+            "session_id": session_key,
+        })
+        score = float(result.get("score") or (result.get("evaluation", 5) * 10))
+        base_eval = float(result.get("evaluation", score / 10))
+        evaluation_payload = {
+            "score": score,
+            "correctness": base_eval,
+            "completeness": result.get("completeness", base_eval),
+            "quality": base_eval,
+            "feedback": result.get("feedback", ""),
+            "strengths": result.get("strengths", []),
+            "improvements": result.get("improvements", []),
+            "keywords_found": result.get("keywords_found", []),
+            "keywords_missed": result.get("keywords_missed", []),
+            "understanding_level": result.get("understanding_level", "intermediate"),
+        }
+        return score, evaluation_payload
+    except Exception as e:
+        logger.warning(f"Не удалось оценить тренировочный ответ: {e}")
+        return 0.0, {
+            "score": 0,
+            "correctness": 0,
+            "completeness": 0,
+            "quality": 0,
+            "feedback": "Не удалось автоматически оценить ответ.",
+            "strengths": [],
+            "improvements": ["Пожалуйста, повторите попытку позже."],
+        }
+
+
+@app.post("/api/training/report")
+async def generate_training_report(
+    request: TrainingReportRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Генерация отчета по тренировочному интервью на основе истории сообщений"""
+    if not request.conversation_history:
+        raise HTTPException(status_code=400, detail="Conversation history is empty")
+    
+    config = request.interview_config or {}
+    
+    try:
+        duration_minutes = config.get("duration_minutes")
+        if duration_minutes is None:
+            timer_config = config.get("timer") or {}
+            duration_minutes = timer_config.get("technical_minutes") or 60
+        try:
+            duration_minutes = int(duration_minutes)
+        except (TypeError, ValueError):
+            duration_minutes = 60
+        
+        programming_languages = (
+            config.get("programming_languages")
+            or config.get("programmingLanguages")
+            or []
+        )
+        
+        interview = Interview(
+            title=f"Training Interview {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}",
+            description="Автоматически созданное тренировочное интервью",
+            topics=config.get("topics"),
+            stages=config.get("stages"),
+            difficulty=config.get("difficulty", "medium"),
+            duration_minutes=duration_minutes,
+            position=config.get("position"),
+            level=config.get("level"),
+            programming_languages=programming_languages,
+            hr_prompt=config.get("hrPrompt"),
+            interview_config=config,
+            created_by=current_user.id
+        )
+        db.add(interview)
+        db.commit()
+        db.refresh(interview)
+        
+        session = InterviewSession(
+            interview_id=interview.id,
+            candidate_id=current_user.id,
+            status=InterviewStatus.IN_PROGRESS,
+            started_at=datetime.utcnow(),
+            current_stage="introduction"
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        
+        qa_pairs = _build_training_pairs(request.conversation_history)
+        if not qa_pairs:
+            raise HTTPException(status_code=400, detail="Недостаточно данных для генерации отчета")
+        
+        session_key = f"training_{session.id}"
+        question_type_map = {
+            "introduction": QuestionType.BEHAVIORAL,
+            "softSkills": QuestionType.BEHAVIORAL,
+            "technical": QuestionType.THEORY,
+            "liveCoding": QuestionType.CODING,
+        }
+        
+        for idx, pair in enumerate(qa_pairs, start=1):
+            stage = pair.get("stage", "technical")
+            question_type = question_type_map.get(stage, QuestionType.THEORY)
+            question = Question(
+                session_id=session.id,
+                question_text=pair["question_text"],
+                question_type=question_type,
+                topic=stage,
+                difficulty=interview.difficulty,
+                expected_keywords=[],
+                order=idx,
+                shown_at=session.started_at
+            )
+            db.add(question)
+            db.flush()
+            
+            score_value, evaluation_payload = await _evaluate_training_answer(
+                stage=stage,
+                question_text=pair["question_text"],
+                answer_text=pair["answer_text"],
+                config=config,
+                session_key=session_key
+            )
+            
+            answer = Answer(
+                question_id=question.id,
+                answer_text=pair["answer_text"],
+                score=score_value,
+                evaluation=evaluation_payload
+            )
+            db.add(answer)
+        
+        db.commit()
+        
+        answers = db.query(Answer).join(Question).filter(
+            Question.session_id == session.id
+        ).all()
+        scores = [ans.score for ans in answers if ans.score is not None]
+        session.total_score = sum(scores) / len(scores) if scores else 0.0
+        session.status = InterviewStatus.COMPLETED
+        session.completed_at = datetime.utcnow()
+        db.commit()
+        db.refresh(session)
+        
+        from backend.services.report_service import report_service
+        from backend.services.agents.report_agent import report_agent
+        
+        interview_data = report_service.export_session_to_json(db, session.id)
+        evaluation_result = await report_agent.evaluate_candidate(
+            interview_data=interview_data,
+            interview_config=config
+        )
+        session.ai_evaluation = evaluation_result
+        db.commit()
+        
+        pdf_path = None
+        try:
+            pdf_path = report_service.generate_pdf_report(db, session.id, force_regenerate=True)
+        except ImportError:
+            logger.warning("reportlab не установлен, PDF отчет не сгенерирован")
+        except Exception as e:
+            logger.warning(f"Не удалось сгенерировать PDF отчет для тренировки: {e}")
+        
+        return {
+            "message": "Training report generated",
+            "session_id": session.id,
+            "report_path": pdf_path,
+            "total_score": session.total_score,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка генерации тренировочного отчета: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/chat/message")
 async def chat_message(
     request: ChatMessageRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user)
 ):
     """Отправка сообщения в чат с AI-интервьюером"""
     import re
@@ -1762,6 +2128,103 @@ async def chat_message(
     
     try:
         message_lower = request.message.lower().strip()
+        
+        def resolve_topic(config: Dict[str, Any]) -> str:
+            topics = config.get("topics") or config.get("required_skills") or []
+            if isinstance(topics, list) and topics:
+                return str(topics[0])
+            if isinstance(topics, str) and topics:
+                return topics
+            return "algorithms"
+        
+        def resolve_language(config: Dict[str, Any]) -> str:
+            languages = (
+                config.get("programming_languages")
+                or config.get("programmingLanguages")
+                or ["python"]
+            )
+            if isinstance(languages, list) and languages:
+                return str(languages[0])
+            if isinstance(languages, str) and languages:
+                return languages
+            return "python"
+        
+        def format_live_coding_question(task_data: Dict[str, Any], config: Dict[str, Any]) -> str:
+            import json as json_module
+
+            def parse_json_like(payload: Any) -> Optional[Any]:
+                if not isinstance(payload, str):
+                    return None
+                cleaned = re.sub(r'<think>.*?</think>', '', payload, flags=re.DOTALL).strip()
+                code_match = re.search(r'```json\s*(.*?)\s*```', cleaned, re.DOTALL)
+                if code_match:
+                    cleaned = code_match.group(1).strip()
+                if not cleaned:
+                    return None
+                if not cleaned.lstrip().startswith(("{", "[")):
+                    return None
+                variants = [cleaned]
+                normalized_quotes = cleaned.replace("“", '"').replace("”", '"')
+                if normalized_quotes != cleaned:
+                    variants.append(normalized_quotes)
+                for variant in variants:
+                    try:
+                        return json_module.loads(variant, strict=False)
+                    except json_module.JSONDecodeError:
+                        continue
+                return None
+
+            def ensure_task_dict(payload: Any) -> Dict[str, Any]:
+                if isinstance(payload, dict):
+                    return payload
+                parsed = parse_json_like(str(payload))
+                if isinstance(parsed, dict):
+                    return parsed
+                return {"question": str(payload).strip()}
+
+            task_payload = ensure_task_dict(task_data)
+
+            question_text: Any = task_payload.get("question") or task_payload.get("task") or ""
+            embedded_tests: Optional[List[Dict[str, Any]]] = None
+            if isinstance(question_text, (dict, list)):
+                question_text = json_module.dumps(question_text, ensure_ascii=False, indent=2)
+            elif isinstance(question_text, str):
+                potential_payload = parse_json_like(question_text)
+                if isinstance(potential_payload, dict) and potential_payload.get("question"):
+                    question_text = potential_payload.get("question", "").strip()
+                    embedded_tests = potential_payload.get("test_cases") or potential_payload.get("tests")
+                question_text = re.sub(r'<think>.*?</think>', '', question_text, flags=re.DOTALL)
+                question_text = question_text.replace("\\n", "\n").strip()
+
+            test_cases: Any = (
+                task_payload.get("test_cases")
+                or task_payload.get("tests")
+                or embedded_tests
+                or []
+            )
+            if isinstance(test_cases, str):
+                parsed_cases = parse_json_like(test_cases)
+                if isinstance(parsed_cases, list):
+                    test_cases = parsed_cases
+                else:
+                    test_cases = []
+
+            tests_block = ""
+            if isinstance(test_cases, list) and test_cases:
+                formatted_cases = []
+                for idx, case in enumerate(test_cases, start=1):
+                    input_data = case.get("input") or case.get("input_data") or case.get("input_example") or ""
+                    expected = case.get("expected_output") or case.get("output") or case.get("expected") or ""
+                    description = case.get("description")
+                    entry = f"{idx}. Input: {input_data} -> Output: {expected}"
+                    if description:
+                        entry += f" ({description})"
+                    formatted_cases.append(entry.strip())
+                tests_block = "\n\nТестовые случаи:\n" + "\n".join(formatted_cases)
+
+            language_hint = task_payload.get("language") or resolve_language(config)
+            prefix = f"[LIVE_CODING]\nЯзык по умолчанию: {language_hint}\n\n"
+            return f"{prefix}**Задача лайвкодинга:**\n{question_text}{tests_block}".strip()
         
         # === ПРОВЕРКА НА PROMPT INJECTION ===
         if detect_injection(request.message):
@@ -1776,6 +2239,16 @@ async def chat_message(
         def classify_question_type(question_text: str) -> str:
             """Определяет тип вопроса: introduction, softSkills или technical"""
             lower_text = question_text.lower()
+            
+            # Ключевые слова/маркеры для лайвкодинга
+            live_coding_keywords = [
+                "[live_coding]", "лайвкодинг", "live coding", "coding task",
+                "coding challenge", "тестовые случаи", "test cases",
+                "пример входных данных", "input:", "output:", "напишите код",
+                "напишите функцию", "реализуйте функцию", "implement the function"
+            ]
+            if any(kw in lower_text for kw in live_coding_keywords) or ("```" in lower_text and ("input" in lower_text or "output" in lower_text)):
+                return "liveCoding"
             
             # Ключевые слова для технических вопросов
             technical_keywords = [
@@ -1963,41 +2436,47 @@ async def chat_message(
                         "interview_config": config,
                         "hr_prompt": config.get("hrPrompt", ""),
                     })
+                    next_question = next_question_data.get("question", "")
                 else:
-                    # Генерируем технический вопрос
-                    topic = "python"
-                    if config:
-                        topics = config.get('topics', [])
-                        if topics:
-                            topic = topics[0]
-                    
-                    next_question_data = await technical_agent.process({
-                        "action": "generate_question",
-                        "topic": topic,
-                        "difficulty": next_difficulty,
-                        "interview_config": config,
-                        "session_id": "chat_session"
-                    })
+                    topic = resolve_topic(config)
+                    if current_stage == "liveCoding":
+                        from backend.services.agents import coding_agent
+                        next_question_data = await coding_agent.process({
+                            "action": "generate_task",
+                            "topic": topic,
+                            "difficulty": config.get("difficulty", "medium"),
+                            "interview_config": config,
+                            "hr_prompt": config.get("hrPrompt", ""),
+                        })
+                        next_question = format_live_coding_question(next_question_data, config)
+                    else:
+                        next_question_data = await technical_agent.process({
+                            "action": "generate_question",
+                            "topic": topic,
+                            "difficulty": next_difficulty,
+                            "interview_config": config,
+                            "session_id": "chat_session"
+                        })
+                        next_question = next_question_data.get("question", "")
                 
-                next_question = next_question_data.get("question", "")
-                
-                # Очистка от <think> блоков и JSON формата
-                if next_question:
-                    next_question = re.sub(r'<think>.*?</think>', '', next_question, flags=re.DOTALL)
-                    if '```json' in next_question or '"question"' in next_question:
-                        json_match = re.search(r'```json\s*(.*?)\s*```', next_question, re.DOTALL)
-                        if json_match:
-                            try:
-                                parsed = json_module.loads(json_match.group(1))
-                                next_question = parsed.get("question", next_question)
-                            except:
-                                pass
-                        else:
-                            json_match = re.search(r'\{[^{}]*"question"\s*:\s*"([^"]+)"[^{}]*\}', next_question)
+                if current_stage != "liveCoding":
+                    next_question = next_question_data.get("question", "") if current_stage in ["introduction", "softSkills"] else next_question
+                    if next_question:
+                        next_question = re.sub(r'<think>.*?</think>', '', next_question, flags=re.DOTALL)
+                        if '```json' in next_question or '"question"' in next_question:
+                            json_match = re.search(r'```json\s*(.*?)\s*```', next_question, re.DOTALL)
                             if json_match:
-                                next_question = json_match.group(1)
-                    next_question = next_question.strip()
-                    next_question = re.sub(r'\n\s*\n\s*\n', '\n\n', next_question)
+                                try:
+                                    parsed = json_module.loads(json_match.group(1))
+                                    next_question = parsed.get("question", next_question)
+                                except:
+                                    pass
+                            else:
+                                json_match = re.search(r'\{[^{}]*"question"\s*:\s*"([^"]+)"[^{}]*\}', next_question)
+                                if json_match:
+                                    next_question = json_match.group(1)
+                        next_question = next_question.strip()
+                        next_question = re.sub(r'\n\s*\n\s*\n', '\n\n', next_question)
                 
                 # Формируем ответ - просто переходим к следующему вопросу
                 if next_question:
@@ -2057,6 +2536,17 @@ async def chat_message(
                     "hr_prompt": config.get("hrPrompt", ""),
                 })
                 question_text = question_data.get("question", "")
+            elif current_stage == "liveCoding":
+                from backend.services.agents import coding_agent
+                topic = resolve_topic(config)
+                question_data = await coding_agent.process({
+                    "action": "generate_task",
+                    "topic": topic,
+                    "difficulty": config.get("difficulty", "medium"),
+                    "interview_config": config,
+                    "hr_prompt": config.get("hrPrompt", ""),
+                })
+                question_text = format_live_coding_question(question_data, config)
             else:
                 # Для технических вопросов используем technical_agent
                 topic = "python"
@@ -2081,7 +2571,7 @@ async def chat_message(
                 question_text = question_data.get("question", "")
             
             # Очистка от <think> блоков и JSON формата
-            if question_text:
+            if question_text and current_stage != "liveCoding":
                 # Удаляем блоки <think>...</think>
                 question_text = re.sub(r'<think>.*?</think>', '', question_text, flags=re.DOTALL)
                 # Пытаемся извлечь вопрос из JSON если он там
@@ -2105,6 +2595,12 @@ async def chat_message(
                 
                 return {
                     "response": f"Отлично! Начинаем собеседование.\n\n**Первый вопрос:**\n{question_text}",
+                    "role": "assistant",
+                    "question_generated": True
+                }
+            elif question_text:
+                return {
+                    "response": f"Отлично! Переходим к лайвкодингу.\n\n{question_text}",
                     "role": "assistant",
                     "question_generated": True
                 }
@@ -2139,6 +2635,19 @@ async def chat_message(
                     "hr_prompt": config.get("hrPrompt", ""),
                 })
             else:
+                if current_stage == "liveCoding":
+                    language_hint = resolve_language(config)
+                    return {
+                        "response": (
+                            "Для задач лайвкодинга используйте редактор кода справа: "
+                            "напишите решение, нажмите «Отправить», а затем сообщите, когда будете готовы продолжить.\n"
+                            f"Подсказка: базовый язык — {language_hint}."
+                        ),
+                        "role": "assistant",
+                        "score": None,
+                        "question_answered": False,
+                        "questions_asked": questions_asked
+                    }
                 # Технический вопрос - используем technical_agent
                 eval_result = await technical_agent.process({
                     "action": "evaluate_answer",
@@ -2234,27 +2743,32 @@ async def chat_message(
                     }
                 
                 # Генерируем следующий вопрос
-                from backend.services.agents import technical_agent
+                from backend.services.agents import technical_agent, coding_agent
                 import json as json_module
                 
-                topic = "python"
-                if request.interview_config:
-                    topics = request.interview_config.get('topics', [])
-                    if topics:
-                        topic = topics[0]
+                config_local = request.interview_config or {}
+                topic = resolve_topic(config_local)
                 
-                next_question_data = await technical_agent.process({
-                    "action": "generate_question",
-                    "topic": topic,
-                    "difficulty": 5,
-                    "interview_config": request.interview_config or {},
-                    "session_id": "chat_session"
-                })
+                if current_stage == "liveCoding":
+                    next_question_data = await coding_agent.process({
+                        "action": "generate_task",
+                        "topic": topic,
+                        "difficulty": config_local.get("difficulty", "medium"),
+                        "interview_config": config_local,
+                        "hr_prompt": config_local.get("hrPrompt", ""),
+                    })
+                    next_question = format_live_coding_question(next_question_data, config_local)
+                else:
+                    next_question_data = await technical_agent.process({
+                        "action": "generate_question",
+                        "topic": topic,
+                        "difficulty": 5,
+                        "interview_config": config_local,
+                        "session_id": "chat_session"
+                    })
+                    next_question = next_question_data.get("question", "")
                 
-                next_question = next_question_data.get("question", "")
-                
-                # Очистка от <think> блоков и JSON формата
-                if next_question:
+                if current_stage != "liveCoding" and next_question:
                     next_question = re.sub(r'<think>.*?</think>', '', next_question, flags=re.DOTALL)
                     if '```json' in next_question or '"question"' in next_question:
                         json_match = re.search(r'```json\s*(.*?)\s*```', next_question, re.DOTALL)
@@ -2342,27 +2856,32 @@ async def chat_message(
             # Если в истории есть вопросы, значит это ответ на вопрос - обрабатываем как пропуск
             if questions_asked > 0:
                 # Генерируем следующий вопрос
-                from backend.services.agents import technical_agent
+                from backend.services.agents import technical_agent, coding_agent
                 import json as json_module
                 
-                topic = "python"
-                if request.interview_config:
-                    topics = request.interview_config.get('topics', [])
-                    if topics:
-                        topic = topics[0]
+                config_local = request.interview_config or {}
+                topic = resolve_topic(config_local)
                 
-                next_question_data = await technical_agent.process({
-                    "action": "generate_question",
-                    "topic": topic,
-                    "difficulty": 5,
-                    "interview_config": request.interview_config or {},
-                    "session_id": "chat_session"
-                })
+                if current_stage == "liveCoding":
+                    next_question_data = await coding_agent.process({
+                        "action": "generate_task",
+                        "topic": topic,
+                        "difficulty": config_local.get("difficulty", "medium"),
+                        "interview_config": config_local,
+                        "hr_prompt": config_local.get("hrPrompt", ""),
+                    })
+                    next_question = format_live_coding_question(next_question_data, config_local)
+                else:
+                    next_question_data = await technical_agent.process({
+                        "action": "generate_question",
+                        "topic": topic,
+                        "difficulty": 5,
+                        "interview_config": config_local,
+                        "session_id": "chat_session"
+                    })
+                    next_question = next_question_data.get("question", "")
                 
-                next_question = next_question_data.get("question", "")
-                
-                # Очистка от <think> блоков и JSON формата
-                if next_question:
+                if current_stage != "liveCoding" and next_question:
                     next_question = re.sub(r'<think>.*?</think>', '', next_question, flags=re.DOTALL)
                     if '```json' in next_question or '"question"' in next_question:
                         json_match = re.search(r'```json\s*(.*?)\s*```', next_question, re.DOTALL)

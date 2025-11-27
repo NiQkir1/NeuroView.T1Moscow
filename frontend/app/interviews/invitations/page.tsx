@@ -31,7 +31,7 @@ export default function InvitationsPage() {
   const [invitations, setInvitations] = useState<InterviewInvitation[]>([])
   const [loading, setLoading] = useState(true)
   const [language, setLanguage] = useState<'ru' | 'en'>('ru')
-  const [completedSessions, setCompletedSessions] = useState<Set<number>>(new Set())
+  const [sessionStatusMap, setSessionStatusMap] = useState<Map<number, string>>(new Map())
 
   useEffect(() => {
     if (!auth.isAuthenticated()) {
@@ -79,19 +79,31 @@ export default function InvitationsPage() {
       // ОПТИМИЗАЦИЯ: Загружаем все данные параллельно одним батчем запросов
       const [invitationsData, sessionsData] = await Promise.all([
         apiClient.get<InterviewInvitation[]>('/api/invitations/my-invitations'),
-        apiClient.get<Array<{ status: string; interview_id: number }>>('/api/user/sessions')
+        apiClient.get<Array<{ status: string; interview_id?: number; interviewId?: number }>>('/api/user/sessions')
       ])
       
       setInvitations(invitationsData)
       
-      // Создаем Set из ID завершенных интервью
-      const completed = new Set<number>()
+      // Формируем карту статусов по interview_id с приоритетом completed > in_progress > scheduled
+      const statusPriority: Record<string, number> = {
+        completed: 3,
+        in_progress: 2,
+        scheduled: 1,
+        draft: 0,
+      }
+      const statusMap = new Map<number, string>()
       sessionsData.forEach((session) => {
-        if (session.status === 'completed' && session.interview_id) {
-          completed.add(session.interview_id)
+        const interviewId = Number(session.interview_id ?? session.interviewId)
+        if (!interviewId) return
+        const normalizedStatus = (session.status || '').toLowerCase()
+        const currentStatus = statusMap.get(interviewId)
+        const currentPriority = currentStatus ? statusPriority[currentStatus] ?? -1 : -1
+        const newPriority = statusPriority[normalizedStatus] ?? -1
+        if (!currentStatus || newPriority >= currentPriority) {
+          statusMap.set(interviewId, normalizedStatus)
         }
       })
-      setCompletedSessions(completed)
+      setSessionStatusMap(statusMap)
     } catch (error) {
       showError('Не удалось загрузить приглашения')
     } finally {
@@ -222,7 +234,6 @@ export default function InvitationsPage() {
                   const expiresAt = invitation.expires_at ? new Date(invitation.expires_at) : null
                   const isExpired = expiresAt && expiresAt < new Date()
                   const canRespond = invitation.status === 'pending' && !isExpired
-                  const isCompleted = completedSessions.has(invitation.interview_id)
 
                   return (
                     <div
@@ -288,7 +299,8 @@ export default function InvitationsPage() {
 
                       {(() => {
                         // Проверяем, завершено ли интервью для этого приглашения
-                        const isCompleted = completedSessions.has(invitation.interview_id)
+                        const sessionStatus = sessionStatusMap.get(invitation.interview_id)
+                        const isCompleted = sessionStatus === 'completed'
                         
                         // Дополнительная проверка через localStorage (на случай, если интервью только что завершено)
                         const interviewCompleted = typeof window !== 'undefined' 
@@ -296,6 +308,7 @@ export default function InvitationsPage() {
                           : false
                         
                         const isInterviewCompleted = isCompleted || interviewCompleted
+                        const isInterviewInProgress = sessionStatus === 'in_progress'
                         
                         if (invitation.status === 'accepted' && !isInterviewCompleted) {
                           return (
@@ -304,7 +317,7 @@ export default function InvitationsPage() {
                                 onClick={async () => {
                                   try {
                                     // Начинаем сессию через приглашение (без кода)
-                                    const data = await apiClient.post(`/api/invitations/${invitation.id}/start-interview`)
+                                    await apiClient.post(`/api/invitations/${invitation.id}/start-interview`)
                                     // Сохраняем информацию о том, что доступ через приглашение
                                     if (typeof window !== 'undefined') {
                                       sessionStorage.setItem(`interview_${invitation.interview_id}_invitation`, 'true')
@@ -318,7 +331,7 @@ export default function InvitationsPage() {
                                 }}
                                 className="px-6 py-2.5 bg-purple-apple text-white rounded-lg hover:bg-purple-apple/80 transition-all font-medium"
                               >
-                                Пройти собеседование
+                                {isInterviewInProgress ? 'Продолжить собеседование' : 'Пройти собеседование'}
                               </button>
                             </div>
                           )

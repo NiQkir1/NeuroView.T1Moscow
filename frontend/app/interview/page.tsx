@@ -204,7 +204,6 @@ export default function InterviewPage() {
   const [question, setQuestion] = useState<string>('')
   const [code, setCode] = useState<string>('// Start writing code here\n\ndef solution():\n    pass\n')
   const [isLoading, setIsLoading] = useState(false)
-  const [evaluation, setEvaluation] = useState<any>(null)
   const [interviewConfig, setInterviewConfig] = useState<InterviewConfig | null>(null)
   const [currentQuestionId, setCurrentQuestionId] = useState<string>('') // ID текущего вопроса для отслеживания смены
   const [sessionId, setSessionId] = useState<number | null>(null) // ID сессии для античита
@@ -1096,9 +1095,8 @@ export default function InterviewPage() {
       }
       
       // Отправляем ответ с античит данными
-      let evaluationData: any = null
       if (questionId) {
-        const data = await apiClient.post(`/api/questions/${questionId}/answers`, {
+        await apiClient.post(`/api/questions/${questionId}/answers`, {
           answer_text: code,
           code_solution: code,
           time_to_answer: timeToAnswer,
@@ -1110,8 +1108,6 @@ export default function InterviewPage() {
           } : null,
           activity_during_answer: activityDuringAnswer.length > 0 ? activityDuringAnswer : null
         }, false) as AnswerResponse
-        evaluationData = data.evaluation || {}
-        setEvaluation(evaluationData)
       } else {
         // Fallback на старый API если нет questionId
         // Формируем тестовые случаи из текущих testCases (если есть)
@@ -1122,20 +1118,17 @@ export default function InterviewPage() {
           passed: tc.status === 'passed',
         }))
         
-        const data = await apiClient.post('/api/ai/evaluate-answer', {
+        const legacyEvaluation = await apiClient.post('/api/ai/evaluate-answer', {
           question: question,
           answer: code,
           code: code,
           language: selectedLanguage,
           test_cases: testCasesForEval.length > 0 ? testCasesForEval : undefined,
           run_tests: true,
-        }, false) as { score?: number; feedback?: string; test_results?: any[]; tests_passed?: number; tests_total?: number }
-        evaluationData = data
-        setEvaluation(evaluationData)
+        }, false) as { test_results?: any[] }
         
-        // Обновляем результаты тестов если получены от сервера
-        if (data.test_results && Array.isArray(data.test_results)) {
-          const updatedTests: TestCase[] = data.test_results.map((tr: any, idx: number) => ({
+        if (legacyEvaluation?.test_results && Array.isArray(legacyEvaluation.test_results)) {
+          const updatedTests: TestCase[] = legacyEvaluation.test_results.map((tr: any, idx: number) => ({
             id: idx + 1,
             input: tr.input || '',
             expectedOutput: tr.expected_output || '',
@@ -1155,8 +1148,8 @@ export default function InterviewPage() {
         id: Date.now().toString(),
         role: 'judge',
         content: language === 'ru' 
-          ? `Оценка: ${evaluationData?.score || 'N/A'}/100. ${evaluationData?.feedback || ''}`
-          : `Score: ${evaluationData?.score || 'N/A'}/100. ${evaluationData?.feedback || ''}`,
+          ? 'Ответ сохранён. Интервьюер уже подбирает следующий вопрос.'
+          : 'Answer saved. The interviewer is preparing the next question.',
         timestamp: new Date(),
       }
       setChatMessages((prev) => [...prev, judgeMessage])
@@ -1308,7 +1301,7 @@ export default function InterviewPage() {
         conversation_history: conversationHistory,
         question_context: question,
         interview_config: currentConfig, // Передаем конфигурацию интервью
-      }, false) as ChatMessageResponse
+      }) as ChatMessageResponse
       
       const assistantMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
@@ -1839,7 +1832,7 @@ export default function InterviewPage() {
                       <li>{language === 'ru' ? 'Получите задачу от AI-интервьюера' : 'Receive task from AI interviewer'}</li>
                       <li>{language === 'ru' ? 'Напишите код в центральном редакторе' : 'Write code in center editor'}</li>
                       <li>{language === 'ru' ? 'Нажмите "Запуск" для теста' : 'Click "Run" to test'}</li>
-                      <li>{language === 'ru' ? 'Нажмите "Отправить" для оценки AI' : 'Click "Submit" for AI evaluation'}</li>
+                      <li>{language === 'ru' ? 'Нажмите "Отправить", чтобы сохранить ответ' : 'Click "Submit" to save your answer'}</li>
                     </ol>
                   </div>
                   <div className="flex items-center justify-center text-text-tertiary">

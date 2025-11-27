@@ -46,6 +46,14 @@ interface EvaluationResult {
 
 interface ChatResponse {
   response: string
+  training_completed?: boolean
+}
+
+interface TrainingReportResponse {
+  message?: string
+  session_id: number
+  report_path?: string
+  total_score?: number
 }
 
 const translations = {
@@ -124,6 +132,8 @@ export default function TrainingPage() {
   const [code, setCode] = useState<string>('// Start writing code here\n\ndef solution():\n    pass\n')
   const [isLoading, setIsLoading] = useState(false)
   const [evaluation, setEvaluation] = useState<any>(null)
+  const [trainingReportGenerated, setTrainingReportGenerated] = useState(false)
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false)
   
   // Восстанавливаем таймер из localStorage или устанавливаем начальное значение
   const getInitialTime = () => {
@@ -725,6 +735,53 @@ export default function TrainingPage() {
     }
   }
 
+  const requestTrainingReport = async (history: ChatMessage[]) => {
+    if (trainingReportGenerated || isGeneratingReport) {
+      return
+    }
+    setIsGeneratingReport(true)
+    try {
+      let trainingConfig = null
+      if (typeof window !== 'undefined') {
+        const configStr = sessionStorage.getItem('training_config')
+        if (configStr) {
+          try {
+            trainingConfig = JSON.parse(configStr)
+          } catch (e) {
+            showError('Ошибка при загрузке конфигурации тренировки')
+          }
+        }
+      }
+
+      const payload = {
+        conversation_history: history.map((msg) => ({
+          role: msg.role,
+          content: msg.content,
+        })),
+        interview_config: trainingConfig,
+      }
+
+      const result = await apiClient.post('/api/training/report', payload) as TrainingReportResponse
+      setTrainingReportGenerated(true)
+
+      const successMessage = language === 'ru'
+        ? 'PDF отчет по тренировке сгенерирован'
+        : 'Training report has been generated'
+      showInfo(successMessage)
+
+      if (result?.report_path) {
+        console.info('Training report saved to:', result.report_path)
+      }
+    } catch (error: any) {
+      console.error('Training report generation error:', error)
+      showError(language === 'ru'
+        ? 'Не удалось сгенерировать отчет о тренировке'
+        : 'Failed to generate training report')
+    } finally {
+      setIsGeneratingReport(false)
+    }
+  }
+
   const handleSendMessage = async () => {
     if (!chatInput.trim() || isSendingMessage) return
     
@@ -735,12 +792,14 @@ export default function TrainingPage() {
       timestamp: new Date(),
     }
     
-    setChatMessages((prev) => [...prev, userMessage])
+    const previousMessages = [...chatMessages]
+    const historyWithUser = [...previousMessages, userMessage]
+    setChatMessages(historyWithUser)
     setChatInput('')
     setIsSendingMessage(true)
     
     try {
-      const conversationHistory = chatMessages.map((msg) => ({
+      const conversationHistory = previousMessages.map((msg) => ({
         role: msg.role === 'user' ? 'user' : 'assistant',
         content: msg.content,
       }))
@@ -763,7 +822,7 @@ export default function TrainingPage() {
         conversation_history: conversationHistory,
         question_context: question,
         interview_config: trainingConfig,
-      }, false) as ChatResponse
+      }) as ChatResponse
       
       const assistantMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
@@ -772,7 +831,8 @@ export default function TrainingPage() {
         timestamp: new Date(),
       }
       
-      setChatMessages((prev) => [...prev, assistantMessage])
+      const finalHistory = [...historyWithUser, assistantMessage]
+      setChatMessages(finalHistory)
       
       // Извлекаем вопрос из ответа, если он содержит маркеры вопросов
       const responseText = data.response || ''
@@ -857,6 +917,9 @@ export default function TrainingPage() {
             }
           }
         }
+      }
+      if (data.training_completed && !trainingReportGenerated) {
+        await requestTrainingReport(finalHistory)
       }
     } catch (error: any) {
       showError(language === 'ru' ? 'Ошибка при отправке сообщения' : 'Error sending message')

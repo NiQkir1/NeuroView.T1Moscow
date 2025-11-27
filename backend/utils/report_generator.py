@@ -655,7 +655,7 @@ class ReportGenerator:
         
         return elements
     
-    def _create_ai_evaluation_section(self, data: Dict[str, Any]) -> List:
+    def _create_ai_evaluation_section(self, data: Dict[str, Any], add_page_break: bool = True) -> List:
         """Создание секции с AI оценкой"""
         if not REPORTLAB_AVAILABLE:
             return []
@@ -665,7 +665,8 @@ class ReportGenerator:
             return []
             
         elements = []
-        elements.append(PageBreak())
+        if add_page_break:
+            elements.append(PageBreak())
         elements.append(Paragraph("Финальная оценка AI", self.styles['ReportSubtitle']))
         elements.append(Spacer(1, 0.2*inch))
         
@@ -904,6 +905,12 @@ class ReportGenerator:
         # Заголовок
         elements.extend(self._create_header(data))
         
+        # AI оценка (перемещена в начало отчета)
+        ai_section = self._create_ai_evaluation_section(data, add_page_break=False)
+        if ai_section:
+            elements.extend(ai_section)
+            elements.append(PageBreak())
+        
         # Вопросы и ответы
         elements.append(Paragraph("Вопросы и ответы", self.styles['ReportSubtitle']))
         elements.append(Spacer(1, 0.2*inch))
@@ -916,9 +923,6 @@ class ReportGenerator:
         
         # Итоговая статистика
         elements.extend(self._create_summary(data))
-        
-        # AI Оценка (новая секция)
-        elements.extend(self._create_ai_evaluation_section(data))
         
         # Секция античита
         elements.extend(self._create_anticheat_section(data))
