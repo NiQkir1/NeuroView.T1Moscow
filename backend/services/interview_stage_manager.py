@@ -66,6 +66,30 @@ class InterviewStageManager:
             return True
         config = interview_config or {}
         stages_config = config.get("stages") or {}
+        questions_per_stage = config.get("questions_per_stage", {}) or config.get("questionsPerStage", {})
+        template_questions = config.get("template_questions", {})
+        
+        stage_questions = questions_per_stage.get(stage_value)
+        # Если явно указано 0 вопросов для стадии - считаем её отключенной
+        if isinstance(stage_questions, (int, float)):
+            if stage_questions <= 0:
+                return False
+        elif isinstance(stage_questions, str):
+            try:
+                numeric = int(stage_questions.strip())
+                if numeric <= 0:
+                    return False
+            except (ValueError, AttributeError):
+                pass
+        elif isinstance(stage_questions, list):
+            # Для introduction/softSkills шаблоны могут храниться в template_questions
+            has_templates = bool(template_questions.get(stage_value))
+            if not stage_questions and not has_templates:
+                return False
+        elif stage_questions is None:
+            # Если ключ присутствует, но значение None - трактуем как 0
+            if stage_value in questions_per_stage:
+                return False
         # По умолчанию стадия активна, если явно не отключена
         return stages_config.get(stage_value, True)
     

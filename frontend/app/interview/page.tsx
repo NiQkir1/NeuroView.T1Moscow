@@ -133,9 +133,9 @@ interface AnswerResponse {
 
 const translations = {
   ru: {
-    run: 'Запуск',
+    run: 'Запустить код',
     running: 'Запуск...',
-    submit: 'Отправить',
+    submit: 'Отправить код на проверку',
     submitting: 'Отправка...',
     testCases: 'Тесты',
     chat: 'Чат',
@@ -162,9 +162,9 @@ const translations = {
     interviewFinished: 'Интервью завершено',
   },
   en: {
-    run: 'Run',
+    run: 'Run code',
     running: 'Running...',
-    submit: 'Submit',
+    submit: 'Submit code',
     submitting: 'Submitting...',
     testCases: 'Tests',
     chat: 'Chat',

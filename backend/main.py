@@ -2235,138 +2235,96 @@ async def chat_message(
             }
         
         # === ПОДСЧЕТ ЗАДАННЫХ ВОПРОСОВ И ОПРЕДЕЛЕНИЕ ТЕКУЩЕГО ЭТАПА ===
-        # Функция для определения типа вопроса по ключевым словам
-        def classify_question_type(question_text: str) -> str:
-            """Определяет тип вопроса: introduction, softSkills или technical"""
-            lower_text = question_text.lower()
-            
-            # Ключевые слова/маркеры для лайвкодинга
-            live_coding_keywords = [
-                "[live_coding]", "лайвкодинг", "live coding", "coding task",
-                "coding challenge", "тестовые случаи", "test cases",
-                "пример входных данных", "input:", "output:", "напишите код",
-                "напишите функцию", "реализуйте функцию", "implement the function"
-            ]
-            if any(kw in lower_text for kw in live_coding_keywords) or ("```" in lower_text and ("input" in lower_text or "output" in lower_text)):
-                return "liveCoding"
-            
-            # Ключевые слова для технических вопросов
-            technical_keywords = [
-                "алгоритм", "сложность", "структура данных", "функция", "метод", "класс",
-                "algorithm", "complexity", "data structure", "function", "method", "class",
-                "код", "code", "программ", "program", "время выполнения", "memory", "o(",
-                "big o", "реализ", "implement", "напиш", "write"
-            ]
-            
-            # Ключевые слова для софт-скиллов
-            soft_skills_keywords = [
-                "команд", "team", "конфликт", "conflict", "коммуникац", "communication",
-                "лидер", "leader", "управл", "manage", "принима решен", "decision",
-                "работа под давлением", "pressure", "стресс", "stress", "мотивац", "motivat",
-                "отношения", "relationship", "сотрудничес", "collaborate"
-            ]
-            
-            # Ключевые слова для знакомства
-            introduction_keywords = [
-                "расскажите о себе", "tell about yourself", "опыт", "experience",
-                "проект", "project", "достижен", "achievement", "работали", "worked",
-                "образован", "education", "university", "карьер", "career",
-                "почему", "why", "интерес", "interest"
-            ]
-            
-            if any(kw in lower_text for kw in technical_keywords):
-                return "technical"
-            elif any(kw in lower_text for kw in soft_skills_keywords):
-                return "softSkills"
-            elif any(kw in lower_text for kw in introduction_keywords):
-                return "introduction"
-            else:
-                # По умолчанию считаем знакомством, если нет явных признаков
-                return "introduction"
+        from backend.services.interview_stage_manager import InterviewStageManager
         
-        # Подсчитываем вопросы по типам из истории
-        questions_by_stage = {
-            "introduction": 0,
-            "softSkills": 0,
-            "technical": 0,
-            "liveCoding": 0
-        }
-        questions_asked = 0
+        STAGE_ORDER = ["introduction", "softSkills", "technical", "liveCoding"]
+        config = request.interview_config or {}
         
-        if request.conversation_history:
-            for msg in request.conversation_history:
-                if msg.get("role") == "assistant":
-                    content = msg.get("content", "")
-                    # Проверяем, содержит ли сообщение вопрос
-                    if "**Первый вопрос:**" in content or "**Следующий вопрос:**" in content:
-                        questions_asked += 1
-                        # Определяем тип вопроса
-                        question_type = classify_question_type(content)
-                        questions_by_stage[question_type] += 1
+        def is_question_message(content: str) -> bool:
+            if not content:
+                return False
+            lowered = content.lower()
+            base_markers = ["**первый вопрос:**", "**следующий вопрос:**"]
+            live_markers = ["**задача лайвкодинга:**", "live coding task", "[live_coding]"]
+            return any(marker in lowered for marker in base_markers) or any(marker in lowered for marker in live_markers)
         
-        # Если есть контекст вопроса, значит уже был задан хотя бы один вопрос
-        if request.question_context:
-            if questions_asked == 0:
-                questions_asked = 1
-                # Определяем тип текущего вопроса
-                question_type = classify_question_type(request.question_context)
-                questions_by_stage[question_type] += 1
+        def compute_stage_requirements(cfg: Dict[str, Any]) -> Dict[str, int]:
+            stage_progress_template = InterviewStageManager.initialize_stage_progress(cfg or {})
+            requirements: Dict[str, int] = {}
+            for stage in STAGE_ORDER:
+                stage_info = stage_progress_template.get(stage, {})
+                requirements[stage] = stage_info.get("questions_required", 0) or 0
+            return requirements
         
-        # === ОПРЕДЕЛЕНИЕ ТЕКУЩЕГО ЭТАПА ===
-        # Функция для определения текущего этапа на основе прогресса
-        def get_current_stage(config: Dict[str, Any], questions_by_stage: Dict[str, int]) -> str:
-            """Определяет текущий этап интервью на основе конфигурации и прогресса"""
-            from backend.services.interview_stage_manager import InterviewStageManager, InterviewStage
+        def build_stage_progress(
+            history: List[Dict[str, Any]],
+            requirements: Dict[str, int],
+            stage_sequence: List[str]
+        ) -> Tuple[Dict[str, int], int]:
+            counts = {stage: 0 for stage in STAGE_ORDER}
+            total_questions = 0
             
-            # Получаем конфигурацию вопросов для каждого этапа
-            questions_per_stage = config.get("questions_per_stage", {}) or config.get("questionsPerStage", {})
-            template_questions = config.get("template_questions", {})
-            stages_config = config.get("stages", {})
+            active_sequence = [stage for stage in stage_sequence if requirements.get(stage, 0) > 0]
+            if not active_sequence:
+                active_sequence = [stage for stage in STAGE_ORDER if requirements.get(stage, 0) > 0]
+            if not active_sequence:
+                active_sequence = ["technical"]
             
-            # Определяем требуемое количество вопросов для каждого этапа
-            required = {}
-            for stage in ["introduction", "softSkills", "technical", "liveCoding"]:
-                # Проверяем, активен ли этап
-                if stages_config and stage in stages_config and not stages_config[stage]:
-                    required[stage] = 0
+            def advance(index: int) -> int:
+                while index < len(active_sequence) and requirements.get(active_sequence[index], 0) == 0:
+                    index += 1
+                return index
+            
+            stage_index = advance(0)
+            
+            for msg in history or []:
+                if msg.get("role") != "assistant":
                     continue
+                content = msg.get("content", "")
+                if not is_question_message(content):
+                    continue
+                total_questions += 1
+                current_idx = min(stage_index, len(active_sequence) - 1)
+                stage_key = active_sequence[current_idx]
+                counts[stage_key] += 1
                 
-                # Для introduction и softSkills проверяем template_questions
-                if stage in ["introduction", "softSkills"]:
-                    templates = template_questions.get(stage, [])
-                    if isinstance(templates, list) and len(templates) > 0:
-                        required[stage] = len(templates)
-                    else:
-                        count = questions_per_stage.get(stage, 0)
-                        required[stage] = len(count) if isinstance(count, list) else (count if isinstance(count, int) else 2)
-                else:
-                    # Для technical и liveCoding
-                    count = questions_per_stage.get(stage, 0)
-                    required[stage] = count if isinstance(count, int) else len(count) if isinstance(count, list) else 2
+                required = requirements.get(stage_key, 0)
+                if required and counts[stage_key] >= required and stage_index < len(active_sequence) - 1:
+                    stage_index = advance(stage_index + 1)
             
-            # Определяем текущий этап на основе прогресса
-            # Проходим по этапам в правильном порядке
-            stage_order = ["introduction", "softSkills", "technical", "liveCoding"]
+            return counts, total_questions
+        
+        def get_current_stage(
+            requirements: Dict[str, int],
+            questions_by_stage: Dict[str, int]
+        ) -> str:
+            stage_order = [stage for stage in STAGE_ORDER if requirements.get(stage, 0) > 0]
+            if not stage_order:
+                stage_order = STAGE_ORDER
             
             for stage in stage_order:
-                # Пропускаем неактивные этапы
-                if required[stage] == 0:
+                required = requirements.get(stage, 0)
+                if required == 0:
                     continue
-                
-                # Если на этом этапе еще не задано достаточно вопросов, это текущий этап
-                if questions_by_stage.get(stage, 0) < required[stage]:
+                if questions_by_stage.get(stage, 0) < required:
                     return stage
             
-            # Если все этапы завершены, возвращаем последний активный
-            for stage in reversed(stage_order):
-                if required[stage] > 0:
-                    return stage
-            
-            return "introduction"  # По умолчанию
+            return stage_order[-1] if stage_order else "introduction"
         
-        # Определяем текущий этап
-        config = request.interview_config or {}
-        current_stage = get_current_stage(config, questions_by_stage)
+        stage_requirements = compute_stage_requirements(config)
+        stage_sequence = InterviewStageManager.get_stage_sequence(config)
+        questions_by_stage, questions_asked = build_stage_progress(
+            request.conversation_history or [],
+            stage_requirements,
+            stage_sequence
+        )
+        
+        if request.question_context and questions_asked == 0:
+            inferred_stage = get_current_stage(stage_requirements, questions_by_stage)
+            questions_by_stage[inferred_stage] += 1
+            questions_asked = 1
+        
+        current_stage = get_current_stage(stage_requirements, questions_by_stage)
         
         # Получаем общий лимит вопросов (сумма всех этапов)
         questions_per_stage = config.get("questions_per_stage", {}) or config.get("questionsPerStage", {})
