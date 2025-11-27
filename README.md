@@ -45,8 +45,45 @@ NeuroView — платформа для проведения техническ�
 - `ANTHROPIC_API_KEY` — ключ Anthropic (опционально).
 - `DEFAULT_LLM_PROVIDER` — `openai` или `anthropic`.
 - `DATABASE_URL` — строка подключения (по умолчанию SQLite `sqlite:///./neuroview.db`).
-- `REDIS_URL` — `redis://redis:6379/0`.
 - Frontend использует `NEXT_PUBLIC_API_URL` для обращения к API (в docker-compose по умолчанию `http://localhost:8000`; при работе через Nginx установите `http://localhost` или домен прокси).
+
+## Пример `.env`
+Создайте файл в корне репозитория:
+```
+# Backend / общие настройки
+OPENAI_API_KEY=sk-your-openai-key
+ANTHROPIC_API_KEY=
+DEFAULT_LLM_PROVIDER=openai
+DATABASE_URL=sqlite:///./neuroview.db
+REDIS_URL=redis://redis:6379/0
+
+# Настройки DockerCodeExecutor
+CODE_EXECUTOR_TIMEOUT=15
+CODE_EXECUTOR_MEMORY_LIMIT=512m
+
+# Frontend (используется в docker-compose)
+NEXT_PUBLIC_API_URL=http://localhost:8000
+```
+Значения можно переопределить в `docker-compose.yml` или через переменные среды в CI/CD.
+
+## Инструкция по запуску
+1. Установите Docker Desktop и включите Docker Compose Plugin.
+2. Склонируйте репозиторий и перейдите в каталог:
+   ```
+   git clone https://github.com/NiQkir1/NeuroView.T1Moscow.git
+   cd NeuroView.T1Moscow
+   ```
+3. Создайте `.env` (см. пример выше) и при необходимости `.env.local` для фронтенда.
+4. Соберите и поднимите сервисы:
+   ```
+   docker compose up --build
+   ```
+5. Проверьте доступность:
+   - API: `http://localhost:8000/health`
+   - Frontend: `http://localhost:3000`
+   - Nginx gateway: `http://localhost`
+6. Для остановки выполните `docker compose down`. Чтобы очистить тома Redis: `docker compose down -v`.
+7. Для локальной разработки без Docker используйте разделы ниже (backend/frontend).
 
 ## Запуск через Docker
 1. Скопируйте пример переменных: `cp backend/env.example .env` и заполните значения (или экспортируйте вручную для compose).
